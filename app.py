@@ -15,7 +15,7 @@ WelcomeScreen - Streamlit + DeepSeek Agent（带工具调用）
 #   1. locale fallback：C.UTF-8（最通用，几乎所有 Linux 容器都有）→ en_US.UTF-8
 #   2. Monkey-patch sys.getdefaultencoding() 返回 'utf-8'
 #   3. 重新配置 stdout/stderr 为 utf-8
-#   4. 改用 urllib.request 标准库发请求（见下方 _post_json），彻底绕开 urllib3
+#   4. 强制时区为 Asia/Shanghai（Streamlit Cloud 容器默认 UTC）
 import locale as _locale
 import os as _os
 import sys as _sys
@@ -32,6 +32,14 @@ del _loc
 
 _os.environ["PYTHONIOENCODING"] = "utf-8"
 _os.environ["PYTHONLEGACYWINDOWSFSENCODING"] = "utf-8"
+# 强制时区为北京时间（UTC+8）。Streamlit Cloud 容器默认是 UTC，
+# 不设置的话 datetime.datetime.now() 会返回 UTC 时间（差 8 小时）。
+_os.environ["TZ"] = "Asia/Shanghai"
+try:
+    import time as _time
+    _time.tzset()  # 仅 Linux/Unix 有效；Windows 跳过
+except (AttributeError, OSError):
+    pass
 
 
 def _forced_utf8_getdefaultencoding():
@@ -56,10 +64,12 @@ del _locale, _os, _sys
   openai SDK 内部某处调用 .encode() 不带 encoding 参数，在 Streamlit Cloud
   容器（sys.getdefaultencoding()='ascii'）下遇到中文会爆 'ascii' codec error。
 
-为什么不用 requests？
-  requests 底层用 urllib3，urllib3 编码 HTTP header 时调 .encode('latin-1')，
-  遇到含中文的 header 值会爆 'latin-1' codec error。
-  改用 Python 标准库 urllib.request，手动 data=bytes 发请求，行为完全可控。
+为什么不用 requests / urllib.request / http.client？
+  - requests 底层用 urllib3，urllib3 编码 HTTP header 时调 .encode('latin-1')
+  - urllib.request 底层走 http.client.HTTPConnection
+  - http.client.HTTPConnection.putheader() 硬编码用 latin-1 编码所有 header value
+  任何一个路径都会爆 'latin-1' codec error。
+  改用纯 socket + ssl 自己拼 HTTP 报文，彻底绕开所有标准库编码路径。
 
 部署到 Streamlit Cloud 后，请在 Settings → Secrets 配置：
   DEEPSEEK_API_KEY = "sk-..."
