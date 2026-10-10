@@ -7,13 +7,17 @@ WelcomeScreen - Streamlit + DeepSeek Agent（带工具调用）
 - calculate：数学计算
 - get_weather：调用高德地图 API 查询天气
 
+为什么不用 openai SDK？
+  openai SDK 内部某处调用 .encode() 不带 encoding 参数，在 Streamlit Cloud
+  容器（sys.getdefaultencoding()='ascii'）下遇到中文会爆 'ascii' codec error。
+  直接用 requests 库调 DeepSeek API，requests 自动用 UTF-8 编码，绕过此问题。
+
 部署到 Streamlit Cloud 后，请在 Settings → Secrets 配置：
   DEEPSEEK_API_KEY = "sk-..."
   AMAP_API_KEY     = "你的高德 key"
 """
 
-# ============== 修复 Streamlit Cloud 容器默认 ASCII 编码 ==============
-# 必须在 import 任何东西之前设置环境变量
+# ============== 强制 UTF-8 编码（防止 Streamlit Cloud ASCII 默认编码问题） ==============
 import os as _os
 _os.environ.setdefault("LC_ALL", "C.UTF-8")
 _os.environ.setdefault("LANG", "C.UTF-8")
@@ -32,39 +36,9 @@ import datetime
 from urllib.parse import quote
 from urllib.request import urlopen, Request
 from urllib.error import URLError
-from openai import OpenAI
+import requests
 from dotenv import load_dotenv
 import streamlit as st
-
-# ============== 关键修复：monkey-patch openai JSON 编码 ==============
-# Streamlit Cloud 容器 sys.getdefaultencoding() 是 ASCII，导致 openai 内部
-# `bytes_str.encode()`（无参数）失败。强制用 UTF-8 重新实现 openapi_dumps。
-#
-# 注意：`from ._utils._json import openapi_dumps` 在 import 时已经把名字绑定到了
-# 各模块的全局命名空间，所以必须 patch 所有引用 openapi_dumps 的模块，而不仅
-# 仅是 `_utils._json` 模块对象。
-import openai._utils._json as _oj_module
-import openai._base_client as _bc_module
-import openai._multipart as _mp_module
-import openai.lib.streaming.agents._tools as _tools_module
-
-def _patched_openapi_dumps(obj):
-    """和 openai SDK 的 _utils/_json.py 一致，但强制 UTF-8 编码"""
-    return json.dumps(
-        obj,
-        cls=_oj_module._CustomEncoder,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
-
-# 在所有可能用到 openapi_dumps 的模块上覆盖名字
-for _mod in (_oj_module, _bc_module, _mp_module, _tools_module):
-    if hasattr(_mod, "openapi_dumps"):
-        _mod.openapi_dumps = _patched_openapi_dumps
-
-del _oj_module, _bc_module, _mp_module, _tools_module
-del _patched_openapi_dumps
 
 # 加载本地 .env（仅本机使用，不会被 Git 上传）
 load_dotenv()
@@ -82,9 +56,11 @@ def get_secret(key: str) -> str:
 DEEPSEEK_API_KEY = get_secret("DEEPSEEK_API_KEY")
 AMAP_API_KEY = get_secret("AMAP_API_KEY")
 
+# DeepSeek 兼容 OpenAI 接口
+DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
+
 
 # ============== 真实工具函数（不是模拟） ==============
-
 def tool_get_current_time() -> str:
     """返回当前时间"""
     now = datetime.datetime.now()
@@ -98,12 +74,10 @@ def tool_calculate(expression: str) -> str:
     """
     if not isinstance(expression, str):
         return "错误：表达式必须是字符串"
-    # 安全：只允许数字、运算符、小数点、空格、括号、e、pi 等
     safe_pattern = re.compile(r"^[\d\s\+\-\*\/\(\)\.\,\%eEpiPI]+$")
     if not safe_pattern.match(expression):
         return f"错误：表达式含不允许的字符: {expression!r}"
     try:
-        # 用 math 命名空间
         import math as _math
         result = eval(expression, {"__builtins__": {}}, {
             "sin": _math.sin, "cos": _math.cos, "tan": _math.tan,
@@ -118,18 +92,12 @@ def tool_calculate(expression: str) -> str:
 
 
 def tool_get_weather(city: str) -> str:
-    """
-    调用高德地图天气 API 查询天气
-    文档: https://lbs.amap.com/api/webservice/guide/api/weatherinfo
-    """
+    """调用高德地图天气 API"""
     if not AMAP_API_KEY:
         return "错误：未配置 AMAP_API_KEY，无法查询天气。请在 Streamlit Secrets 中配置。"
     if not city or not isinstance(city, str):
         return "错误：城市名不能为空"
 
-    # 第一步：先用"输入提示"接口把城市名 → adcode
-    # 高德 API 简化处理：直接传 city 作为 keywords 让高德自动识别
-    # 实测直接传中文城市名（如 "北京"）高德能识别
     url = (
         f"https://restapi.amap.com/v3/weather/weatherInfo"
         f"?city={quote(city)}&key={AMAP_API_KEY}&extensions=base&output=JSON"
@@ -162,7 +130,7 @@ def tool_get_weather(city: str) -> str:
     )
 
 
-# ============== OpenAI 工具定义 ==============
+# ============== 工具 schema（OpenAI 兼容） ==============
 TOOLS_SCHEMA = [
     {
         "type": "function",
@@ -208,12 +176,76 @@ TOOLS_SCHEMA = [
     },
 ]
 
-# 工具名 → 真实函数映射
 TOOL_FUNCS = {
     "get_current_time": tool_get_current_time,
     "calculate": tool_calculate,
     "get_weather": tool_get_weather,
 }
+
+
+# ============== 关键：用 requests 调 DeepSeek（彻底绕开 openai SDK 的 ASCII bug） ==============
+def call_deepseek_non_stream(messages, model, temperature):
+    """非流式调用，返回完整响应 dict"""
+    headers = {
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Content-Type": "application/json; charset=utf-8",
+    }
+    payload = {
+        "model": model,
+        "temperature": temperature,
+        "messages": messages,
+        "tools": TOOLS_SCHEMA,
+        "tool_choice": "auto",
+    }
+    # requests 的 json= 参数会用 utf-8 编码 body（urllib3 内部处理）
+    resp = requests.post(DEEPSEEK_URL, headers=headers, json=payload, timeout=60)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def call_deepseek_stream(messages, model, temperature):
+    """
+    流式调用，返回一个 generator，每个生成增量文本字符串。
+    SSE 格式: data: {...}\n\n  data: [DONE]\n\n
+    """
+    headers = {
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Content-Type": "application/json; charset=utf-8",
+        "Accept": "text/event-stream",
+    }
+    payload = {
+        "model": model,
+        "temperature": temperature,
+        "messages": messages,
+        "stream": True,
+    }
+    resp = requests.post(DEEPSEEK_URL, headers=headers, json=payload, timeout=60, stream=True)
+    resp.raise_for_status()
+
+    # 逐行解析 SSE
+    # resp.iter_lines() 返回 bytes
+    for raw_line in resp.iter_lines(chunk_size=1):
+        if not raw_line:
+            continue
+        # raw_line 是 bytes，转 str 用 utf-8（response.encoding 应该是 utf-8）
+        line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, bytes) else raw_line
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        data_str = line[5:].strip()
+        if data_str == "[DONE]":
+            break
+        try:
+            chunk = json.loads(data_str)
+        except json.JSONDecodeError:
+            continue
+        # OpenAI 兼容 SSE: choices[0].delta.content
+        choices = chunk.get("choices") or []
+        if choices:
+            delta = choices[0].get("delta") or {}
+            content = delta.get("content") or ""
+            if content:
+                yield content
 
 
 # ============== 页面配置 ==============
@@ -243,7 +275,7 @@ with st.sidebar:
     model = st.selectbox(
         "选择模型",
         ["deepseek-reasoner", "deepseek-chat"],
-        index=0,  # 默认 reasoner（对工具调用更稳定）
+        index=0,
         help="deepseek-reasoner：深度思考模型，对工具调用更稳定；deepseek-chat：通用对话模型",
     )
     temperature = st.slider("Temperature", min_value=0.0, max_value=1.5, value=0.5, step=0.1)
@@ -275,8 +307,6 @@ if not DEEPSEEK_API_KEY or DEEPSEEK_API_KEY == "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxx
     )
     st.stop()
 
-client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
-
 
 # ============== 对话区 ==============
 st.divider()
@@ -289,7 +319,6 @@ if "messages" not in st.session_state:
 for msg in st.session_state.messages:
     role = msg["role"]
     if role == "tool":
-        # 工具结果用灰色块显示
         with st.chat_message("assistant"):
             st.markdown(f"🔧 **工具 `{msg.get('name', '')}` 返回：**\n\n```\n{msg['content']}\n```")
     elif role in ("user", "assistant"):
@@ -300,59 +329,51 @@ for msg in st.session_state.messages:
 # ============== Agent 循环 ==============
 def run_agent(user_input: str, model: str, temperature: float, system_prompt: str):
     """
-    Agent 循环：不断调用直到没有 tool_calls 为止
-    流式输出最终给用户的回复
+    Agent 循环：调用模型 → 如果有 tool_calls 就执行工具 → 把工具结果加入 messages →
+    再调一次模型 → 直到模型不再调用工具，最后流式输出回复。
     """
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_input},
     ]
 
-    # 第一轮：模型决定是否调用工具
     while True:
+        # 第一轮（决策阶段）：非流式
         try:
-            response = client.chat.completions.create(
-                model=model,
-                temperature=temperature,
-                messages=messages,
-                tools=TOOLS_SCHEMA,
-                tool_choice="auto",
-                stream=False,  # 工具调用决策阶段不开流式
-            )
+            resp_json = call_deepseek_non_stream(messages, model, temperature)
         except Exception as e:
             return f"调用失败：{e}", []
 
-        choice = response.choices[0]
-        msg = choice.message
+        choice = (resp_json.get("choices") or [{}])[0]
+        msg = choice.get("message") or {}
 
-        # 1. 模型想调用工具
-        if msg.tool_calls:
-            # 把模型这轮的 tool_calls 也加入 messages
+        # 模型想调用工具
+        tool_calls = msg.get("tool_calls")
+        if tool_calls:
+            # 把模型这一轮（带 tool_calls）加入 messages
             messages.append({
                 "role": "assistant",
-                "content": msg.content or "",
+                "content": msg.get("content") or "",
                 "tool_calls": [
                     {
-                        "id": tc.id,
+                        "id": tc.get("id"),
                         "type": "function",
                         "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments,
+                            "name": tc["function"]["name"],
+                            "arguments": tc["function"]["arguments"],
                         },
                     }
-                    for tc in msg.tool_calls
+                    for tc in tool_calls
                 ],
             })
-
-            # 执行每个工具调用
-            for tc in msg.tool_calls:
-                fn_name = tc.function.name
-                fn_args_raw = tc.function.arguments or "{}"
+            # 执行每个工具
+            for tc in tool_calls:
+                fn_name = tc["function"]["name"]
+                fn_args_raw = tc["function"].get("arguments") or "{}"
                 try:
                     fn_args = json.loads(fn_args_raw)
                 except json.JSONDecodeError:
                     fn_args = {}
-
                 fn = TOOL_FUNCS.get(fn_name)
                 if not fn:
                     result = f"错误：未知工具 {fn_name}"
@@ -361,30 +382,20 @@ def run_agent(user_input: str, model: str, temperature: float, system_prompt: st
                         result = fn(**fn_args)
                     except Exception as e:
                         result = f"工具执行出错：{e}"
-
-                # 把工具结果加入 messages
+                # 工具结果加入 messages
                 messages.append({
                     "role": "tool",
-                    "tool_call_id": tc.id,
+                    "tool_call_id": tc.get("id"),
                     "name": fn_name,
                     "content": str(result),
                 })
+            continue  # 继续下一轮
 
-            # 继续下一轮（让模型基于工具结果继续生成）
-            continue
-
-        # 2. 模型不再调用工具，开始流式输出最终回复
+        # 没有 tool_calls，进入最终流式输出
         final_text = ""
         placeholder = st.empty()
         try:
-            stream = client.chat.completions.create(
-                model=model,
-                temperature=temperature,
-                messages=messages,
-                stream=True,
-            )
-            for chunk in stream:
-                delta = chunk.choices[0].delta.content or ""
+            for delta in call_deepseek_stream(messages, model, temperature):
                 final_text += delta
                 placeholder.markdown(final_text + "▌")
             placeholder.markdown(final_text)
@@ -398,12 +409,10 @@ def run_agent(user_input: str, model: str, temperature: float, system_prompt: st
 # ============== 用户输入 ==============
 user_input = st.chat_input("请输入你的问题，回车发送...")
 if user_input and user_input.strip():
-    # 显示用户消息
     st.session_state.messages.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    # 调用 Agent（带工具的循环）
     with st.chat_message("assistant"):
         with st.spinner("思考中..."):
             final_text, _ = run_agent(user_input, model, temperature, system_prompt)
