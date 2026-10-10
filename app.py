@@ -148,16 +148,32 @@ def tool_calculate(expression: str) -> str:
         return f"计算失败: {e}"
 
 
-def tool_get_weather(city: str) -> str:
-    """调用高德地图天气 API"""
+def tool_get_weather(city: str, days: int = 7) -> str:
+    """
+    调用高德地图天气 API，返回未来 N 天天气预报（默认 7 天）。
+    使用 extensions=all 接口（预报天气），不是 extensions=base（实时天气）。
+
+    Args:
+        city: 城市名称，如 "北京"、"上海"
+        days: 要返回的天数，1-7。默认 7（包含今天）。
+              1 → 只今天；2 → 今天+明天；7 → 未来一周。
+    """
     if not AMAP_API_KEY:
         return "错误：未配置 AMAP_API_KEY，无法查询天气。请在 Streamlit Secrets 中配置。"
     if not city or not isinstance(city, str):
         return "错误：城市名不能为空"
 
+    # 限制 days 在 1-7
+    try:
+        days = int(days)
+    except (TypeError, ValueError):
+        days = 7
+    days = max(1, min(7, days))
+
     url = (
         f"https://restapi.amap.com/v3/weather/weatherInfo"
-        f"?city={quote(city)}&key={AMAP_API_KEY}&extensions=base&output=JSON"
+        f"?city={quote(city)}&key={AMAP_API_KEY}"
+        f"&extensions=all&forecast_days={days}&output=JSON"
     )
     try:
         req = Request(url, headers={"User-Agent": "Streamlit-DeepSeek-Agent/1.0"})
@@ -172,19 +188,55 @@ def tool_get_weather(city: str) -> str:
     if status != "1":
         return f"高德返回错误：status={status}, info={data.get('info')}, infocode={data.get('infocode')}"
 
-    lives = data.get("lives") or []
-    if not lives:
+    forecasts = data.get("forecasts") or []
+    if not forecasts:
         return f"未找到 {city} 的天气信息"
 
-    info = lives[0]
-    return (
-        f"📍 {info.get('city')} 当前天气：\n"
-        f"  🌡️ 温度：{info.get('temperature')}°C\n"
-        f"  💧 湿度：{info.get('humidity')}%\n"
-        f"  🌬️ 风向：{info.get('winddirection')} 风力 {info.get('windpower')} 级\n"
-        f"  ☁️ 天气：{info.get('weather')}\n"
-        f"  🕐 报告时间：{info.get('reporttime')}"
-    )
+    info = forecasts[0]
+    city_name = info.get("city", city)
+    reporttime = info.get("reporttime", "未知")
+    casts = info.get("casts") or []
+    if not casts:
+        return f"未找到 {city_name} 的预报数据"
+
+    # 周几映射（高德返回 1=周一, 2=周二, ..., 7=周日）
+    week_map = {"1": "周一", "2": "周二", "3": "周三", "4": "周四", "5": "周五", "6": "周六", "7": "周日"}
+
+    lines = [
+        f"📍 {city_name} 未来 {len(casts)} 天天气预报",
+        f"🕐 预报发布时间：{reporttime}",
+        "",
+    ]
+
+    for i, cast in enumerate(casts):
+        date = cast.get("date", "?")
+        week_num = str(cast.get("week", "?"))
+        week_cn = week_map.get(week_num, f"周{week_num}")
+        day_weather = cast.get("dayweather", "?")
+        night_weather = cast.get("nightweather", "?")
+        day_temp = cast.get("daytemp", "?")
+        night_temp = cast.get("nighttemp", "?")
+        day_wind = cast.get("daywind", "?")
+        night_wind = cast.get("nightwind", "?")
+        day_power = cast.get("daypower", "?")
+        night_power = cast.get("nightpower", "?")
+
+        # 标签：第一天=今天，第二天=明天，第三天=后天
+        if i == 0:
+            label = "（今天）"
+        elif i == 1:
+            label = "（明天）"
+        elif i == 2:
+            label = "（后天）"
+        else:
+            label = ""
+
+        lines.append(f"📅 {date} {week_cn} {label}".rstrip())
+        lines.append(f"   ☀️ 白天：{day_weather}，{day_temp}°C，{day_wind}风 {day_power}级")
+        lines.append(f"   🌙 夜间：{night_weather}，{night_temp}°C，{night_wind}风 {night_power}级")
+        lines.append("")
+
+    return "\n".join(lines).rstrip()
 
 
 # ============== 工具 schema（OpenAI 兼容） ==============
@@ -218,13 +270,27 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "get_weather",
-            "description": "查询某个城市的实时天气。需要传入城市名（如 '北京'、'上海'）。使用高德地图 API。",
+            "description": (
+                "查询某个城市的天气预报（默认未来 7 天，包含今天）。"
+                "使用高德地图 API，每天预报包含白天/夜间天气、温度、风向风力。"
+                "如果用户只想知道今天，传 days=1；问'明天'传 days=2；问'未来一周'传 days=7（或不传，默认 7）。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "city": {
                         "type": "string",
                         "description": "城市名称，例如 '北京'、'上海'、'广州'",
+                    },
+                    "days": {
+                        "type": "integer",
+                        "description": (
+                            "要返回的天数，1-7。默认 7（包含今天）。"
+                            "1=只今天；2=今天+明天；7=未来一周。"
+                        ),
+                        "minimum": 1,
+                        "maximum": 7,
+                        "default": 7,
                     },
                 },
                 "required": ["city"],
@@ -508,9 +574,10 @@ with st.sidebar:
             "  - 时间 / 日期 / 几点 / 星期 → get_current_time\n"
             "  - 数学 / 计算 / 算 / 等于 / + - * / 表达式 → calculate\n"
             "  - 天气 / 温度 / 下雨 / 城市 → get_weather\n"
+            "【天气工具细节】get_weather 默认返回未来 7 天（含今天），用户问'今天'传 days=1，'明天'传 days=2。\n"
             "其他闲聊问题正常回答即可。"
         ),
-        height=160,
+        height=180,
     )
     st.divider()
     if st.button("🗑️ 清空对话"):
