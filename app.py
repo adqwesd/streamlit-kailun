@@ -1,7 +1,15 @@
 # -*- coding: utf-8 -*-
 """
 WelcomeScreen - Streamlit + DeepSeek Agent（带工具调用）
+"""
 
+import os
+# 强制Python IO、环境为utf8，解决latin-1编码问题
+os.environ["PYTHONIOENCODING"] = "utf-8"
+os.environ["LANG"] = "en_US.UTF-8"
+os.environ["LC_ALL"] = "en_US.UTF-8"
+
+"""
 真实工具（非模拟）：
 - get_current_time：获取当前时间
 - calculate：数学计算
@@ -18,15 +26,11 @@ WelcomeScreen - Streamlit + DeepSeek Agent（带工具调用）
 """
 
 # ============== 强制 UTF-8 编码（防止 Streamlit Cloud ASCII 默认编码问题） ==============
-import os as _os
-_os.environ.setdefault("LC_ALL", "C.UTF-8")
-_os.environ.setdefault("LANG", "C.UTF-8")
-_os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 import sys as _sys
 if hasattr(_sys.stdout, "reconfigure"):
     _sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
     _sys.stderr.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
-del _os, _sys
+del _sys
 
 # ============== 正常 import ==============
 import os
@@ -184,12 +188,30 @@ TOOL_FUNCS = {
 
 
 # ============== 关键：用 requests 调 DeepSeek（彻底绕开 openai SDK 的 ASCII bug） ==============
-def call_deepseek_non_stream(messages, model, temperature):
-    """非流式调用，返回完整响应 dict"""
+def _post_json(payload: dict, stream: bool = False):
+    """
+    完全手动序列化 JSON body 为 UTF-8 字节，再用 requests.post(data=...) 发送。
+    这样 requests/urllib3 不会做任何"自动编码"（包括 latin-1 编码），
+    彻底避免 Streamlit Cloud 容器的 ASCII/latin-1 默认编码问题。
+    """
+    body_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
         "Content-Type": "application/json; charset=utf-8",
     }
+    if stream:
+        headers["Accept"] = "text/event-stream"
+    return requests.post(
+        DEEPSEEK_URL,
+        headers=headers,
+        data=body_bytes,         # 用 data=，不是 json=
+        stream=stream,
+        timeout=60,
+    )
+
+
+def call_deepseek_non_stream(messages, model, temperature):
+    """非流式调用，返回完整响应 dict"""
     payload = {
         "model": model,
         "temperature": temperature,
@@ -197,37 +219,26 @@ def call_deepseek_non_stream(messages, model, temperature):
         "tools": TOOLS_SCHEMA,
         "tool_choice": "auto",
     }
-    # requests 的 json= 参数会用 utf-8 编码 body（urllib3 内部处理）
-    resp = requests.post(DEEPSEEK_URL, headers=headers, json=payload, timeout=60)
+    resp = _post_json(payload, stream=False)
     resp.raise_for_status()
     return resp.json()
 
 
 def call_deepseek_stream(messages, model, temperature):
-    """
-    流式调用，返回一个 generator，每个生成增量文本字符串。
-    SSE 格式: data: {...}\n\n  data: [DONE]\n\n
-    """
-    headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-        "Content-Type": "application/json; charset=utf-8",
-        "Accept": "text/event-stream",
-    }
+    """流式调用，返回 generator，每个生成增量文本字符串（SSE 解析）"""
     payload = {
         "model": model,
         "temperature": temperature,
         "messages": messages,
         "stream": True,
     }
-    resp = requests.post(DEEPSEEK_URL, headers=headers, json=payload, timeout=60, stream=True)
+    resp = _post_json(payload, stream=True)
     resp.raise_for_status()
 
-    # 逐行解析 SSE
-    # resp.iter_lines() 返回 bytes
+    # SSE 解析（响应是 utf-8 bytes，逐行处理）
     for raw_line in resp.iter_lines(chunk_size=1):
         if not raw_line:
             continue
-        # raw_line 是 bytes，转 str 用 utf-8（response.encoding 应该是 utf-8）
         line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, bytes) else raw_line
         line = line.strip()
         if not line.startswith("data:"):
@@ -239,7 +250,6 @@ def call_deepseek_stream(messages, model, temperature):
             chunk = json.loads(data_str)
         except json.JSONDecodeError:
             continue
-        # OpenAI 兼容 SSE: choices[0].delta.content
         choices = chunk.get("choices") or []
         if choices:
             delta = choices[0].get("delta") or {}
