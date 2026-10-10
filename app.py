@@ -36,6 +36,25 @@ from openai import OpenAI
 from dotenv import load_dotenv
 import streamlit as st
 
+# ============== 关键修复：monkey-patch openai JSON 编码 ==============
+# Streamlit Cloud 容器 sys.getdefaultencoding() 是 ASCII，导致 openai 内部
+# `bytes_str.encode()`（无参数）失败。强制用 UTF-8 重新实现 openapi_dumps。
+import openai._utils._json as _oj_module
+
+def _patched_openapi_dumps(obj):
+    """和 openai SDK 的 _utils/_json.py 一致，但强制 UTF-8 编码"""
+    return json.dumps(
+        obj,
+        cls=_oj_module._CustomEncoder,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+_oj_module.openapi_dumps = _patched_openapi_dumps
+del _oj_module
+del _patched_openapi_dumps
+
 # 加载本地 .env（仅本机使用，不会被 Git 上传）
 load_dotenv()
 
