@@ -71,6 +71,8 @@ import os
 import re
 import json
 import datetime
+import socket
+import ssl
 from urllib.parse import quote
 from urllib.request import urlopen, Request
 from urllib.error import URLError
@@ -228,32 +230,173 @@ TOOL_FUNCS = {
 }
 
 
-# ============== 关键：用 urllib.request 标准库调 DeepSeek（彻底绕开 urllib3 latin-1 bug） ==============
-def _post_json(payload: dict):
-    """
-    完全手动序列化 JSON body 为 UTF-8 字节，再用标准库 urllib.request 发 POST。
-    urllib.request 不依赖 urllib3，所有编码路径可控。
+# ============== 关键：纯 socket 发 HTTPS POST（彻底绕开 http.client 的 latin-1 bug） ==============
 
-    为什么用 urllib.request 而不是 requests？
-      requests 底层走 urllib3。urllib3 在拼装 HTTP header 时会做
-      `str.encode('latin-1')`，在 Streamlit Cloud 容器（locale=ASCII）下，
-      一旦某个 header 字段含非 ASCII 字符就爆 'latin-1' codec error。
-      改用 urllib.request，手动 data=body_bytes，所有 header 都是纯 ASCII
-      （Authorization、Content-Type、Accept），不会触发 latin-1 路径。
+def _send_http_post(host: str, path: str, headers: dict, body_bytes: bytes,
+                    port: int = 443, use_https: bool = True, timeout: float = 60):
     """
+    用纯 socket 发 HTTPS POST 请求。
+
+    为什么不用 urllib.request 或 http.client？
+      Python 标准库 http.client.HTTPConnection.putheader() 硬编码
+      .encode('latin-1', 'strict') 编码所有 header value。
+      含非 ASCII 字符的 header 会爆 'latin-1' codec error。
+      用纯 socket 自己拼 HTTP 报文，绕开所有标准库编码路径。
+
+    Args:
+        host: 服务器域名
+        path: URL 路径
+        headers: 所有 value 必须是纯 ASCII；非 ASCII 抛清晰错误（含位置）
+        body_bytes: 已编码好的请求体 bytes
+
+    Returns:
+        (status_code: int, resp_headers: dict, body_iter: generator)
+        body_iter 逐块 yield body bytes（chunked encoding 已自动解码）
+    """
+    # 1. 校验所有 header value 是纯 ASCII
+    for k, v in headers.items():
+        try:
+            v.encode("ascii")
+        except UnicodeEncodeError as e:
+            bad = [(i, c, f"U+{ord(c):04X}") for i, c in enumerate(v) if ord(c) >= 128]
+            raise ValueError(
+                f"HTTP header '{k}' 含非 ASCII 字符 (位置 {e.start}-{e.end})：{bad[:5]}\n"
+                f"提示：检查 Streamlit Secrets 中的密钥配置，可能有多余的不可见字符。"
+            ) from e
+
+    # 2. 拼 HTTP 请求报文（全 ASCII）
+    lines = [
+        f"POST {path} HTTP/1.1",
+        f"Host: {host}",
+        "User-Agent: Streamlit-DeepSeek-Agent/1.0",
+        "Accept: text/event-stream",
+    ]
+    for k, v in headers.items():
+        lines.append(f"{k}: {v}")
+    lines.append(f"Content-Length: {len(body_bytes)}")
+    lines.append("Connection: close")
+    lines.append("")
+    lines.append("")
+
+    request_bytes = "\r\n".join(lines).encode("ascii")
+
+    # 3. 建立连接（含 HTTPS）
+    sock = socket.create_connection((host, port), timeout=timeout)
+    if use_https:
+        ctx = ssl.create_default_context()
+        sock = ctx.wrap_socket(sock, server_hostname=host)
+
+    sock.sendall(request_bytes + body_bytes)
+
+    # 4. 读 HTTP header（一次性读到 \r\n\r\n）
+    header_buf = b""
+    while b"\r\n\r\n" not in header_buf:
+        chunk = sock.recv(1)
+        if not chunk:
+            raise RuntimeError("连接关闭，未读到完整 HTTP header")
+        header_buf += chunk
+        if len(header_buf) > 16384:
+            raise RuntimeError("HTTP header 过大 (>16KB)")
+
+    sep = header_buf.find(b"\r\n\r\n")
+    raw_headers = header_buf[:sep].decode("latin-1")
+    initial_body = header_buf[sep + 4:]
+
+    # 5. 解析 status line
+    status_line = raw_headers.split("\r\n")[0]
+    parts = status_line.split(" ", 2)
+    if len(parts) < 2:
+        raise RuntimeError(f"无效 status line: {status_line!r}")
+    status_code = int(parts[1])
+
+    # 6. 解析其他 headers
+    resp_headers = {}
+    for line in raw_headers.split("\r\n")[1:]:
+        if ":" in line:
+            k, v = line.split(":", 1)
+            resp_headers[k.strip().lower()] = v.strip()
+
+    is_chunked = resp_headers.get("transfer-encoding", "").lower() == "chunked"
+
+    return status_code, resp_headers, _iter_body(sock, initial_body, is_chunked)
+
+
+def _iter_body(sock, initial_buffer, is_chunked):
+    """generator: 逐块 yield 响应 body bytes，处理 chunked / 普通两种模式"""
+    try:
+        if is_chunked:
+            yield from _read_chunked(sock, initial_buffer)
+        else:
+            # 无 Content-Length 或 Connection: close → 读到 EOF
+            yield initial_buffer
+            while True:
+                chunk = sock.recv(8192)
+                if not chunk:
+                    break
+                yield chunk
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
+def _read_chunked(sock, initial_buffer):
+    """解码 chunked transfer encoding 的流"""
+    buffer = initial_buffer
+    while True:
+        # 找 chunk size 行
+        while b"\r\n" not in buffer:
+            chunk = sock.recv(4096)
+            if not chunk:
+                return
+            buffer += chunk
+
+        line_end = buffer.find(b"\r\n")
+        size_line = buffer[:line_end].decode("ascii", errors="replace").strip()
+        chunk_size_str = size_line.split(";", 1)[0].strip()
+        try:
+            chunk_size = int(chunk_size_str, 16)
+        except ValueError:
+            return
+
+        if chunk_size == 0:
+            return  # 终止 chunk
+
+        # 读 chunk 数据（可能跨多次 recv）
+        buffer = buffer[line_end + 2:]
+        while len(buffer) < chunk_size:
+            chunk = sock.recv(max(4096, chunk_size - len(buffer)))
+            if not chunk:
+                return
+            buffer += chunk
+
+        yield buffer[:chunk_size]
+        buffer = buffer[chunk_size:]
+        # 跳过 trailing \r\n
+        if buffer.startswith(b"\r\n"):
+            buffer = buffer[2:]
+        elif buffer.startswith(b"\n"):
+            buffer = buffer[1:]
+
+
+def _post_json(payload: dict):
+    """发请求到 DeepSeek，返回 (status_code, resp_headers, body_iter)"""
     body_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     headers = {
         "Authorization": "Bearer " + DEEPSEEK_API_KEY,
         "Content-Type": "application/json; charset=utf-8",
         "Accept": "text/event-stream",
     }
-    req = Request(
-        DEEPSEEK_URL,
-        data=body_bytes,
+    return _send_http_post(
+        host="api.deepseek.com",
+        path="/v1/chat/completions",
         headers=headers,
-        method="POST",
+        body_bytes=body_bytes,
+        port=443,
+        use_https=True,
+        timeout=60,
     )
-    return urlopen(req, timeout=60)
 
 
 def call_deepseek_non_stream(messages, model, temperature):
@@ -265,9 +408,13 @@ def call_deepseek_non_stream(messages, model, temperature):
         "tools": TOOLS_SCHEMA,
         "tool_choice": "auto",
     }
-    with _post_json(payload) as resp:
-        raw = resp.read().decode("utf-8", errors="replace")
-    return json.loads(raw)
+    status_code, resp_headers, body_iter = _post_json(payload)
+    full_body = b"".join(body_iter)
+    if status_code >= 400:
+        raise RuntimeError(
+            f"DeepSeek API 返回 {status_code}：{full_body.decode('utf-8', errors='replace')[:500]}"
+        )
+    return json.loads(full_body.decode("utf-8", errors="replace"))
 
 
 def call_deepseek_stream(messages, model, temperature):
@@ -278,42 +425,38 @@ def call_deepseek_stream(messages, model, temperature):
         "messages": messages,
         "stream": True,
     }
-    resp = _post_json(payload)
+    status_code, resp_headers, body_iter = _post_json(payload)
+    if status_code >= 400:
+        full_body = b"".join(body_iter)
+        raise RuntimeError(
+            f"DeepSeek API 返回 {status_code}：{full_body.decode('utf-8', errors='replace')[:500]}"
+        )
 
     # SSE 解析（响应是 utf-8 bytes，按行分割处理）
     buffer = b""
-    try:
-        while True:
-            chunk = resp.read(4096)
-            if not chunk:
-                break
-            buffer += chunk
-            while b"\n" in buffer:
-                line_bytes, buffer = buffer.split(b"\n", 1)
-                try:
-                    line = line_bytes.decode("utf-8", errors="replace").strip()
-                except Exception:
-                    continue
-                if not line.startswith("data:"):
-                    continue
-                data_str = line[5:].strip()
-                if data_str == "[DONE]":
-                    return
-                try:
-                    chunk_json = json.loads(data_str)
-                except json.JSONDecodeError:
-                    continue
-                choices = chunk_json.get("choices") or []
-                if choices:
-                    delta = choices[0].get("delta") or {}
-                    content = delta.get("content") or ""
-                    if content:
-                        yield content
-    finally:
-        try:
-            resp.close()
-        except Exception:
-            pass
+    for chunk in body_iter:
+        buffer += chunk
+        while b"\n" in buffer:
+            line_bytes, buffer = buffer.split(b"\n", 1)
+            try:
+                line = line_bytes.decode("utf-8", errors="replace").strip()
+            except Exception:
+                continue
+            if not line.startswith("data:"):
+                continue
+            data_str = line[5:].strip()
+            if data_str == "[DONE]":
+                return
+            try:
+                chunk_json = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+            choices = chunk_json.get("choices") or []
+            if choices:
+                delta = choices[0].get("delta") or {}
+                content = delta.get("content") or ""
+                if content:
+                    yield content
 
 
 # ============== 页面配置 ==============
