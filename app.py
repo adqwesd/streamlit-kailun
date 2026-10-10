@@ -39,7 +39,14 @@ import streamlit as st
 # ============== 关键修复：monkey-patch openai JSON 编码 ==============
 # Streamlit Cloud 容器 sys.getdefaultencoding() 是 ASCII，导致 openai 内部
 # `bytes_str.encode()`（无参数）失败。强制用 UTF-8 重新实现 openapi_dumps。
+#
+# 注意：`from ._utils._json import openapi_dumps` 在 import 时已经把名字绑定到了
+# 各模块的全局命名空间，所以必须 patch 所有引用 openapi_dumps 的模块，而不仅
+# 仅是 `_utils._json` 模块对象。
 import openai._utils._json as _oj_module
+import openai._base_client as _bc_module
+import openai._multipart as _mp_module
+import openai.lib.streaming.agents._tools as _tools_module
 
 def _patched_openapi_dumps(obj):
     """和 openai SDK 的 _utils/_json.py 一致，但强制 UTF-8 编码"""
@@ -51,8 +58,12 @@ def _patched_openapi_dumps(obj):
         allow_nan=False,
     ).encode("utf-8")
 
-_oj_module.openapi_dumps = _patched_openapi_dumps
-del _oj_module
+# 在所有可能用到 openapi_dumps 的模块上覆盖名字
+for _mod in (_oj_module, _bc_module, _mp_module, _tools_module):
+    if hasattr(_mod, "openapi_dumps"):
+        _mod.openapi_dumps = _patched_openapi_dumps
+
+del _oj_module, _bc_module, _mp_module, _tools_module
 del _patched_openapi_dumps
 
 # 加载本地 .env（仅本机使用，不会被 Git 上传）
