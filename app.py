@@ -12,6 +12,19 @@ WelcomeScreen - Streamlit + DeepSeek Agent（带工具调用）
   AMAP_API_KEY     = "你的高德 key"
 """
 
+# ============== 修复 Streamlit Cloud 容器默认 ASCII 编码 ==============
+# 必须在 import 任何东西之前设置环境变量
+import os as _os
+_os.environ.setdefault("LC_ALL", "C.UTF-8")
+_os.environ.setdefault("LANG", "C.UTF-8")
+_os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+import sys as _sys
+if hasattr(_sys.stdout, "reconfigure"):
+    _sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+    _sys.stderr.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+del _os, _sys
+
+# ============== 正常 import ==============
 import os
 import re
 import json
@@ -199,17 +212,22 @@ with st.sidebar:
     st.header("⚙️ 设置")
     model = st.selectbox(
         "选择模型",
-        ["deepseek-chat", "deepseek-reasoner"],
-        index=0,
+        ["deepseek-reasoner", "deepseek-chat"],
+        index=0,  # 默认 reasoner（对工具调用更稳定）
+        help="deepseek-reasoner：深度思考模型，对工具调用更稳定；deepseek-chat：通用对话模型",
     )
     temperature = st.slider("Temperature", min_value=0.0, max_value=1.5, value=0.5, step=0.1)
     system_prompt = st.text_area(
         "系统提示词",
         value=(
             "你是一名非常可爱的 AI 助手。请用温柔可爱的语气回答用户问题。\n"
-            "当用户问天气、计算、时间时，必须调用对应工具，不要自己瞎猜或编造数据。"
+            "【强制规则】当用户提到以下任何场景时，必须调用对应工具，绝不能凭空编造：\n"
+            "  - 时间 / 日期 / 几点 / 星期 → get_current_time\n"
+            "  - 数学 / 计算 / 算 / 等于 / + - * / 表达式 → calculate\n"
+            "  - 天气 / 温度 / 下雨 / 城市 → get_weather\n"
+            "其他闲聊问题正常回答即可。"
         ),
-        height=120,
+        height=160,
     )
     st.divider()
     if st.button("🗑️ 清空对话"):
