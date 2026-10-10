@@ -3,11 +3,48 @@
 WelcomeScreen - Streamlit + DeepSeek Agent（带工具调用）
 """
 
-import os
-# 强制Python IO、环境为utf8，解决latin-1编码问题
-os.environ["PYTHONIOENCODING"] = "utf-8"
-os.environ["LANG"] = "en_US.UTF-8"
-os.environ["LC_ALL"] = "en_US.UTF-8"
+# ============== 强制 UTF-8 编码（四重防御，解决 Streamlit Cloud ASCII/latin-1 问题） ==============
+# 这一段必须在所有其它 import 之前执行。
+#
+# 根因：Streamlit Cloud 容器的 Python 默认编码是 'ascii'，
+#       任何调用 .encode() 不带 encoding 参数的代码，遇到中文都会爆。
+#       加上 urllib3 在编码 HTTP header 时硬编码用 latin-1，
+#       导致即使手动 data=body_bytes 也会在 header 处理路径上失败。
+#
+# 防御策略（按优先级）：
+#   1. locale fallback：C.UTF-8（最通用，几乎所有 Linux 容器都有）→ en_US.UTF-8
+#   2. Monkey-patch sys.getdefaultencoding() 返回 'utf-8'
+#   3. 重新配置 stdout/stderr 为 utf-8
+#   4. 改用 urllib.request 标准库发请求（见下方 _post_json），彻底绕开 urllib3
+import locale as _locale
+import os as _os
+import sys as _sys
+
+for _loc in ("C.UTF-8", "C.utf-8", "en_US.UTF-8", "en_US.utf-8"):
+    try:
+        _locale.setlocale(_locale.LC_ALL, _loc)
+        _os.environ["LC_ALL"] = _loc
+        _os.environ["LANG"] = _loc
+        break
+    except _locale.Error:
+        continue
+del _loc
+
+_os.environ["PYTHONIOENCODING"] = "utf-8"
+_os.environ["PYTHONLEGACYWINDOWSFSENCODING"] = "utf-8"
+
+
+def _forced_utf8_getdefaultencoding():
+    return "utf-8"
+
+
+_sys.getdefaultencoding = _forced_utf8_getdefaultencoding
+
+if hasattr(_sys.stdout, "reconfigure"):
+    _sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+    _sys.stderr.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+
+del _locale, _os, _sys
 
 """
 真实工具（非模拟）：
@@ -18,19 +55,16 @@ os.environ["LC_ALL"] = "en_US.UTF-8"
 为什么不用 openai SDK？
   openai SDK 内部某处调用 .encode() 不带 encoding 参数，在 Streamlit Cloud
   容器（sys.getdefaultencoding()='ascii'）下遇到中文会爆 'ascii' codec error。
-  直接用 requests 库调 DeepSeek API，requests 自动用 UTF-8 编码，绕过此问题。
+
+为什么不用 requests？
+  requests 底层用 urllib3，urllib3 编码 HTTP header 时调 .encode('latin-1')，
+  遇到含中文的 header 值会爆 'latin-1' codec error。
+  改用 Python 标准库 urllib.request，手动 data=bytes 发请求，行为完全可控。
 
 部署到 Streamlit Cloud 后，请在 Settings → Secrets 配置：
   DEEPSEEK_API_KEY = "sk-..."
   AMAP_API_KEY     = "你的高德 key"
 """
-
-# ============== 强制 UTF-8 编码（防止 Streamlit Cloud ASCII 默认编码问题） ==============
-import sys as _sys
-if hasattr(_sys.stdout, "reconfigure"):
-    _sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
-    _sys.stderr.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
-del _sys
 
 # ============== 正常 import ==============
 import os
@@ -40,7 +74,14 @@ import datetime
 from urllib.parse import quote
 from urllib.request import urlopen, Request
 from urllib.error import URLError
-import requests
+
+# requests 不再用于 DeepSeek 请求路径（会触发 urllib3 latin-1 bug），
+# 但保留 import 以便将来如果需要 fallback 时可用。
+try:
+    import requests  # noqa: F401
+except ImportError:
+    pass
+
 from dotenv import load_dotenv
 import streamlit as st
 
@@ -187,27 +228,32 @@ TOOL_FUNCS = {
 }
 
 
-# ============== 关键：用 requests 调 DeepSeek（彻底绕开 openai SDK 的 ASCII bug） ==============
-def _post_json(payload: dict, stream: bool = False):
+# ============== 关键：用 urllib.request 标准库调 DeepSeek（彻底绕开 urllib3 latin-1 bug） ==============
+def _post_json(payload: dict):
     """
-    完全手动序列化 JSON body 为 UTF-8 字节，再用 requests.post(data=...) 发送。
-    这样 requests/urllib3 不会做任何"自动编码"（包括 latin-1 编码），
-    彻底避免 Streamlit Cloud 容器的 ASCII/latin-1 默认编码问题。
+    完全手动序列化 JSON body 为 UTF-8 字节，再用标准库 urllib.request 发 POST。
+    urllib.request 不依赖 urllib3，所有编码路径可控。
+
+    为什么用 urllib.request 而不是 requests？
+      requests 底层走 urllib3。urllib3 在拼装 HTTP header 时会做
+      `str.encode('latin-1')`，在 Streamlit Cloud 容器（locale=ASCII）下，
+      一旦某个 header 字段含非 ASCII 字符就爆 'latin-1' codec error。
+      改用 urllib.request，手动 data=body_bytes，所有 header 都是纯 ASCII
+      （Authorization、Content-Type、Accept），不会触发 latin-1 路径。
     """
     body_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Authorization": "Bearer " + DEEPSEEK_API_KEY,
         "Content-Type": "application/json; charset=utf-8",
+        "Accept": "text/event-stream",
     }
-    if stream:
-        headers["Accept"] = "text/event-stream"
-    return requests.post(
+    req = Request(
         DEEPSEEK_URL,
+        data=body_bytes,
         headers=headers,
-        data=body_bytes,         # 用 data=，不是 json=
-        stream=stream,
-        timeout=60,
+        method="POST",
     )
+    return urlopen(req, timeout=60)
 
 
 def call_deepseek_non_stream(messages, model, temperature):
@@ -219,9 +265,9 @@ def call_deepseek_non_stream(messages, model, temperature):
         "tools": TOOLS_SCHEMA,
         "tool_choice": "auto",
     }
-    resp = _post_json(payload, stream=False)
-    resp.raise_for_status()
-    return resp.json()
+    with _post_json(payload) as resp:
+        raw = resp.read().decode("utf-8", errors="replace")
+    return json.loads(raw)
 
 
 def call_deepseek_stream(messages, model, temperature):
@@ -232,30 +278,42 @@ def call_deepseek_stream(messages, model, temperature):
         "messages": messages,
         "stream": True,
     }
-    resp = _post_json(payload, stream=True)
-    resp.raise_for_status()
+    resp = _post_json(payload)
 
-    # SSE 解析（响应是 utf-8 bytes，逐行处理）
-    for raw_line in resp.iter_lines(chunk_size=1):
-        if not raw_line:
-            continue
-        line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, bytes) else raw_line
-        line = line.strip()
-        if not line.startswith("data:"):
-            continue
-        data_str = line[5:].strip()
-        if data_str == "[DONE]":
-            break
+    # SSE 解析（响应是 utf-8 bytes，按行分割处理）
+    buffer = b""
+    try:
+        while True:
+            chunk = resp.read(4096)
+            if not chunk:
+                break
+            buffer += chunk
+            while b"\n" in buffer:
+                line_bytes, buffer = buffer.split(b"\n", 1)
+                try:
+                    line = line_bytes.decode("utf-8", errors="replace").strip()
+                except Exception:
+                    continue
+                if not line.startswith("data:"):
+                    continue
+                data_str = line[5:].strip()
+                if data_str == "[DONE]":
+                    return
+                try:
+                    chunk_json = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+                choices = chunk_json.get("choices") or []
+                if choices:
+                    delta = choices[0].get("delta") or {}
+                    content = delta.get("content") or ""
+                    if content:
+                        yield content
+    finally:
         try:
-            chunk = json.loads(data_str)
-        except json.JSONDecodeError:
-            continue
-        choices = chunk.get("choices") or []
-        if choices:
-            delta = choices[0].get("delta") or {}
-            content = delta.get("content") or ""
-            if content:
-                yield content
+            resp.close()
+        except Exception:
+            pass
 
 
 # ============== 页面配置 ==============
