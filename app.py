@@ -1,14 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-WelcomeScreen - Streamlit 欢迎页 + DeepSeek 对话 Demo（流式输出版）
+WelcomeScreen - Streamlit + DeepSeek Agent（带工具调用）
 
-部署到 Streamlit Cloud 后，请到后台 Secrets 配置 DEEPSEEK_API_KEY：
-  DEEPSEEK_API_KEY = "sk-你的真实密钥"
+真实工具（非模拟）：
+- get_current_time：获取当前时间
+- calculate：数学计算
+- get_weather：调用高德地图 API 查询天气
 
-本地运行：streamlit run app.py
+部署到 Streamlit Cloud 后，请在 Settings → Secrets 配置：
+  DEEPSEEK_API_KEY = "sk-..."
+  AMAP_API_KEY     = "你的高德 key"
 """
 
 import os
+import re
+import json
+import datetime
+from urllib.parse import quote
+from urllib.request import urlopen, Request
+from urllib.error import URLError
 from openai import OpenAI
 from dotenv import load_dotenv
 import streamlit as st
@@ -17,86 +27,327 @@ import streamlit as st
 load_dotenv()
 
 
-# ---------- 密钥读取 ----------
-def get_api_key() -> str:
+# ============== 密钥读取 ==============
+def get_secret(key: str) -> str:
     """优先从 st.secrets 读取（Streamlit Cloud），否则从环境变量/.env 读取"""
     try:
-        return st.secrets["DEEPSEEK_API_KEY"]
+        return st.secrets[key]
     except (KeyError, FileNotFoundError):
-        return os.environ.get("DEEPSEEK_API_KEY") or ""
+        return os.environ.get(key) or ""
 
 
-def get_client() -> OpenAI:
-    """根据密钥创建 OpenAI 客户端（指向 DeepSeek）"""
-    api_key = get_api_key()
-    if not api_key:
-        st.error(
-            "❌ 未找到 DEEPSEEK_API_KEY\n\n"
-            "**本地运行**：在项目根目录的 `.env` 文件中配置：\n\n"
-            "```\nDEEPSEEK_API_KEY=sk-你的密钥\n```\n\n"
-            "**Streamlit Cloud**：到应用的 `Settings → Secrets` 中添加：\n\n"
-            "```toml\nDEEPSEEK_API_KEY = \"sk-你的密钥\"\n```"
-        )
-        st.stop()
-    return OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
+DEEPSEEK_API_KEY = get_secret("DEEPSEEK_API_KEY")
+AMAP_API_KEY = get_secret("AMAP_API_KEY")
 
 
-# ========== 页面配置 ==========
+# ============== 真实工具函数（不是模拟） ==============
+
+def tool_get_current_time() -> str:
+    """返回当前时间"""
+    now = datetime.datetime.now()
+    return now.strftime("%Y-%m-%d %H:%M:%S %A")
+
+
+def tool_calculate(expression: str) -> str:
+    """
+    计算数学表达式（沙箱执行）
+    只允许数字、运算符、常用数学函数名，禁止其他字符。
+    """
+    if not isinstance(expression, str):
+        return "错误：表达式必须是字符串"
+    # 安全：只允许数字、运算符、小数点、空格、括号、e、pi 等
+    safe_pattern = re.compile(r"^[\d\s\+\-\*\/\(\)\.\,\%eEpiPI]+$")
+    if not safe_pattern.match(expression):
+        return f"错误：表达式含不允许的字符: {expression!r}"
+    try:
+        # 用 math 命名空间
+        import math as _math
+        result = eval(expression, {"__builtins__": {}}, {
+            "sin": _math.sin, "cos": _math.cos, "tan": _math.tan,
+            "sqrt": _math.sqrt, "log": _math.log, "ln": _math.log,
+            "log10": _math.log10, "exp": _math.exp, "pow": _math.pow,
+            "pi": _math.pi, "e": _math.e, "abs": abs, "round": round,
+            "min": min, "max": max,
+        })
+        return f"{expression} = {result}"
+    except Exception as e:
+        return f"计算失败: {e}"
+
+
+def tool_get_weather(city: str) -> str:
+    """
+    调用高德地图天气 API 查询天气
+    文档: https://lbs.amap.com/api/webservice/guide/api/weatherinfo
+    """
+    if not AMAP_API_KEY:
+        return "错误：未配置 AMAP_API_KEY，无法查询天气。请在 Streamlit Secrets 中配置。"
+    if not city or not isinstance(city, str):
+        return "错误：城市名不能为空"
+
+    # 第一步：先用"输入提示"接口把城市名 → adcode
+    # 高德 API 简化处理：直接传 city 作为 keywords 让高德自动识别
+    # 实测直接传中文城市名（如 "北京"）高德能识别
+    url = (
+        f"https://restapi.amap.com/v3/weather/weatherInfo"
+        f"?city={quote(city)}&key={AMAP_API_KEY}&extensions=base&output=JSON"
+    )
+    try:
+        req = Request(url, headers={"User-Agent": "Streamlit-DeepSeek-Agent/1.0"})
+        with urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except URLError as e:
+        return f"网络请求失败: {e}"
+    except Exception as e:
+        return f"查询失败: {e}"
+
+    status = data.get("status")
+    if status != "1":
+        return f"高德返回错误：status={status}, info={data.get('info')}, infocode={data.get('infocode')}"
+
+    lives = data.get("lives") or []
+    if not lives:
+        return f"未找到 {city} 的天气信息"
+
+    info = lives[0]
+    return (
+        f"📍 {info.get('city')} 当前天气：\n"
+        f"  🌡️ 温度：{info.get('temperature')}°C\n"
+        f"  💧 湿度：{info.get('humidity')}%\n"
+        f"  🌬️ 风向：{info.get('winddirection')} 风力 {info.get('windpower')} 级\n"
+        f"  ☁️ 天气：{info.get('weather')}\n"
+        f"  🕐 报告时间：{info.get('reporttime')}"
+    )
+
+
+# ============== OpenAI 工具定义 ==============
+TOOLS_SCHEMA = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_current_time",
+            "description": "获取当前时间。当用户询问'现在几点'、'今天日期'、'星期几'等时间相关问题时调用。",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "calculate",
+            "description": "执行数学计算。表达式使用 Python 语法，支持 + - * / () 和三角函数、sqrt、log、pi、e 等。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "expression": {
+                        "type": "string",
+                        "description": "要计算的数学表达式，例如 '(3 + 5) * 2' 或 'sqrt(2) + pi'",
+                    },
+                },
+                "required": ["expression"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "查询某个城市的实时天气。需要传入城市名（如 '北京'、'上海'）。使用高德地图 API。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": {
+                        "type": "string",
+                        "description": "城市名称，例如 '北京'、'上海'、'广州'",
+                    },
+                },
+                "required": ["city"],
+            },
+        },
+    },
+]
+
+# 工具名 → 真实函数映射
+TOOL_FUNCS = {
+    "get_current_time": tool_get_current_time,
+    "calculate": tool_calculate,
+    "get_weather": tool_get_weather,
+}
+
+
+# ============== 页面配置 ==============
 st.set_page_config(
-    page_title="WelcomeScreen · DeepSeek Demo",
+    page_title="WelcomeScreen · DeepSeek Agent",
     page_icon="🤖",
     layout="centered",
 )
 
-# ========== 欢迎页 ==========
-st.title("🎉 WelcomeScreen")
-st.subheader("一个由 DeepSeek 大模型驱动的 AI 对话 Demo（流式输出 ✨）")
+st.title("🎉 WelcomeScreen · Agent")
+st.subheader("DeepSeek Agent：天气 🌤️ 计算 🧮 时间 🕐，自动调用真实工具")
 
 st.markdown(
     """
-    👋 欢迎来到 **WelcomeScreen**！
+    👋 这是一个**真正的 AI Agent**，不是模拟！
 
-    - 🤖 使用 DeepSeek 大模型，支持**流式输出**（像打字机一样）
-    - 🔐 密钥通过 `st.secrets` / 环境变量管理，**安全无泄露**
-    - 💬 在下方输入问题开始聊天吧
+    当你问下面这些类型的问题，AI 会**自动调用工具**：
+    - 🕐 **"现在几点？"** → 调用 `get_current_time`
+    - 🧮 **"123 × 456 等于多少？"** → 调用 `calculate`
+    - 🌤️ **"北京今天天气怎么样？"** → 调用 `get_weather`（高德 API）
     """
 )
 
-st.divider()
-
-# ========== 侧边栏设置 ==========
+# ============== 侧边栏 ==============
 with st.sidebar:
     st.header("⚙️ 设置")
     model = st.selectbox(
         "选择模型",
         ["deepseek-chat", "deepseek-reasoner"],
         index=0,
-        help="deepseek-chat：通用对话模型；deepseek-reasoner：深度思考模型",
     )
-    temperature = st.slider("Temperature", min_value=0.0, max_value=1.5, value=0.7, step=0.1)
+    temperature = st.slider("Temperature", min_value=0.0, max_value=1.5, value=0.5, step=0.1)
     system_prompt = st.text_area(
         "系统提示词",
-        value="你是一名非常可爱的 AI 助手，请用温柔可爱的语气回答用户的问题。",
-        height=100,
+        value=(
+            "你是一名非常可爱的 AI 助手。请用温柔可爱的语气回答用户问题。\n"
+            "当用户问天气、计算、时间时，必须调用对应工具，不要自己瞎猜或编造数据。"
+        ),
+        height=120,
     )
     st.divider()
     if st.button("🗑️ 清空对话"):
         st.session_state.messages = []
         st.rerun()
 
-# ========== 对话区 ==========
+# ============== 密钥校验 ==============
+if not DEEPSEEK_API_KEY or DEEPSEEK_API_KEY == "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx":
+    st.error(
+        "❌ 未检测到 DEEPSEEK_API_KEY\n\n"
+        "**本地运行**：在 `.env` 文件中配置。\n\n"
+        "**Streamlit Cloud**：到应用的 `Settings → Secrets` 添加：\n\n"
+        "```toml\nDEEPSEEK_API_KEY = \"sk-你的密钥\"\n"
+        "AMAP_API_KEY = \"你的高德 key\"\n```"
+    )
+    st.stop()
+
+client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
+
+
+# ============== 对话区 ==============
+st.divider()
 st.header("💬 和 AI 聊聊天")
 
-# 用 session_state 保存历史对话
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
 # 显示历史
 for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
+    role = msg["role"]
+    if role == "tool":
+        # 工具结果用灰色块显示
+        with st.chat_message("assistant"):
+            st.markdown(f"🔧 **工具 `{msg.get('name', '')}` 返回：**\n\n```\n{msg['content']}\n```")
+    elif role in ("user", "assistant"):
+        with st.chat_message(role):
+            st.markdown(msg["content"])
 
-# 用户输入
+
+# ============== Agent 循环 ==============
+def run_agent(user_input: str, model: str, temperature: float, system_prompt: str):
+    """
+    Agent 循环：不断调用直到没有 tool_calls 为止
+    流式输出最终给用户的回复
+    """
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_input},
+    ]
+
+    # 第一轮：模型决定是否调用工具
+    while True:
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                temperature=temperature,
+                messages=messages,
+                tools=TOOLS_SCHEMA,
+                tool_choice="auto",
+                stream=False,  # 工具调用决策阶段不开流式
+            )
+        except Exception as e:
+            return f"调用失败：{e}", []
+
+        choice = response.choices[0]
+        msg = choice.message
+
+        # 1. 模型想调用工具
+        if msg.tool_calls:
+            # 把模型这轮的 tool_calls 也加入 messages
+            messages.append({
+                "role": "assistant",
+                "content": msg.content or "",
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in msg.tool_calls
+                ],
+            })
+
+            # 执行每个工具调用
+            for tc in msg.tool_calls:
+                fn_name = tc.function.name
+                fn_args_raw = tc.function.arguments or "{}"
+                try:
+                    fn_args = json.loads(fn_args_raw)
+                except json.JSONDecodeError:
+                    fn_args = {}
+
+                fn = TOOL_FUNCS.get(fn_name)
+                if not fn:
+                    result = f"错误：未知工具 {fn_name}"
+                else:
+                    try:
+                        result = fn(**fn_args)
+                    except Exception as e:
+                        result = f"工具执行出错：{e}"
+
+                # 把工具结果加入 messages
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "name": fn_name,
+                    "content": str(result),
+                })
+
+            # 继续下一轮（让模型基于工具结果继续生成）
+            continue
+
+        # 2. 模型不再调用工具，开始流式输出最终回复
+        final_text = ""
+        placeholder = st.empty()
+        try:
+            stream = client.chat.completions.create(
+                model=model,
+                temperature=temperature,
+                messages=messages,
+                stream=True,
+            )
+            for chunk in stream:
+                delta = chunk.choices[0].delta.content or ""
+                final_text += delta
+                placeholder.markdown(final_text + "▌")
+            placeholder.markdown(final_text)
+        except Exception as e:
+            final_text = f"流式输出失败：{e}"
+            placeholder.markdown(final_text)
+
+        return final_text, []
+
+
+# ============== 用户输入 ==============
 user_input = st.chat_input("请输入你的问题，回车发送...")
 if user_input and user_input.strip():
     # 显示用户消息
@@ -104,31 +355,9 @@ if user_input and user_input.strip():
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    # 调用 AI（流式输出）
-    client = get_client()
+    # 调用 Agent（带工具的循环）
     with st.chat_message("assistant"):
-        placeholder = st.empty()
-        full_reply = ""
-        try:
-            stream = client.chat.completions.create(
-                model=model,
-                temperature=temperature,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    *[
-                        {"role": m["role"], "content": m["content"]}
-                        for m in st.session_state.messages
-                    ],
-                ],
-                stream=True,
-            )
-            for chunk in stream:
-                delta = chunk.choices[0].delta.content or ""
-                full_reply += delta
-                placeholder.markdown(full_reply + "▌")  # ▌ 模拟光标
-            placeholder.markdown(full_reply)
-        except Exception as e:
-            st.error(f"出错了：{e}")
-            full_reply = f"（出错）{e}"
+        with st.spinner("思考中..."):
+            final_text, _ = run_agent(user_input, model, temperature, system_prompt)
 
-    st.session_state.messages.append({"role": "assistant", "content": full_reply})
+    st.session_state.messages.append({"role": "assistant", "content": final_text})
