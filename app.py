@@ -239,6 +239,19 @@ def tool_get_weather(city: str, days: int = 7) -> str:
     return "\n".join(lines).rstrip()
 
 
+# ============== 系统提示词的强制规则（硬编码，不让用户改） ==============
+# 强制规则确保 AI 必须调用工具而不是凭空编造时间/计算/天气结果。
+# 用户在侧边栏只填角色部分（语气/性格），规则会自动附加。
+SYSTEM_PROMPT_RULES = (
+    "\n\n"
+    "【强制规则】当用户提到以下任何场景时，必须调用对应工具，绝不能凭空编造：\n"
+    "  - 时间 / 日期 / 几点 / 星期 → get_current_time\n"
+    "  - 数学 / 计算 / 算 / 等于 / + - * / 表达式 → calculate\n"
+    "  - 天气 / 温度 / 下雨 / 城市 → get_weather（默认未来 7 天，问'今天'传 days=1，问'明天'传 days=2）\n"
+    "其他闲聊问题正常回答即可。"
+)
+
+
 # ============== 工具 schema（OpenAI 兼容） ==============
 TOOLS_SCHEMA = [
     {
@@ -566,18 +579,12 @@ with st.sidebar:
         help="deepseek-reasoner：深度思考模型，对工具调用更稳定；deepseek-chat：通用对话模型",
     )
     temperature = st.slider("Temperature", min_value=0.0, max_value=1.5, value=0.5, step=0.1)
-    system_prompt = st.text_area(
-        "系统提示词",
-        value=(
-            "你是一名非常可爱的 AI 助手。请用温柔可爱的语气回答用户问题。\n"
-            "【强制规则】当用户提到以下任何场景时，必须调用对应工具，绝不能凭空编造：\n"
-            "  - 时间 / 日期 / 几点 / 星期 → get_current_time\n"
-            "  - 数学 / 计算 / 算 / 等于 / + - * / 表达式 → calculate\n"
-            "  - 天气 / 温度 / 下雨 / 城市 → get_weather\n"
-            "【天气工具细节】get_weather 默认返回未来 7 天（含今天），用户问'今天'传 days=1，'明天'传 days=2。\n"
-            "其他闲聊问题正常回答即可。"
-        ),
-        height=180,
+    # 侧边栏：只让用户填角色部分（语气/性格/人物设定）
+    role_prompt = st.text_area(
+        "角色设定",
+        value="你是一名非常可爱的 AI 助手。请用温柔可爱的语气回答用户问题。",
+        height=100,
+        help="这里只填 AI 的角色/语气/性格。工具调用的强制规则在代码里硬编码，会自动附加。",
     )
     st.divider()
     if st.button("🗑️ 清空对话"):
@@ -703,6 +710,8 @@ if user_input and user_input.strip():
 
     with st.chat_message("assistant"):
         with st.spinner("思考中..."):
-            final_text, _ = run_agent(user_input, model, temperature, system_prompt)
+            # 用户角色 + 代码硬编码的强制规则
+            full_system_prompt = role_prompt + SYSTEM_PROMPT_RULES
+            final_text, _ = run_agent(user_input, model, temperature, full_system_prompt)
 
     st.session_state.messages.append({"role": "assistant", "content": final_text})
