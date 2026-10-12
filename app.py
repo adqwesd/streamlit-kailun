@@ -680,12 +680,8 @@ st.set_page_config(
 # ============== 侧边栏 ==============
 with st.sidebar:
     st.header("⚙️ 设置")
-    model = st.selectbox(
-        "选择模型",
-        ["deepseek-chat", "deepseek-reasoner"],
-        index=0,
-        help="deepseek-chat：通用对话模型，回复快；deepseek-reasoner：深度思考模型，思考过程较长",
-    )
+    # 模型固定为 deepseek-chat（用户不可选）
+    model = "deepseek-chat"
     temperature = st.slider("Temperature", min_value=0.0, max_value=1.5, value=0.5, step=0.1)
     # 侧边栏：只让用户填角色部分（语气/性格/人物设定）
     role_prompt = st.text_area(
