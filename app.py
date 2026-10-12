@@ -80,9 +80,11 @@ del _locale, _os, _sys
 import os
 import re
 import json
+import uuid
 import datetime
 import socket
 import ssl
+from pathlib import Path
 from urllib.parse import quote
 from urllib.request import urlopen, Request
 from urllib.error import URLError
@@ -250,6 +252,114 @@ SYSTEM_PROMPT_RULES = (
     "  - 天气 / 温度 / 下雨 / 城市 → get_weather（默认未来 7 天，问'今天'传 days=1，问'明天'传 days=2）\n"
     "其他闲聊问题正常回答即可。"
 )
+
+
+# ============== 历史会话存储 ==============
+# ⚠️ 路径是本地 Windows 路径，Streamlit Cloud（Linux）上不可访问。
+# 在云端部署时，历史功能会自动失效，UI 上会显示警告。
+HISTORY_DIR = Path(r"D:\python-project\WelcomeScreen\streamlit_kailun\Conversation")
+
+
+def _ensure_history_dir() -> bool:
+    """确保历史目录存在；返回是否可用（True=可用，False=不可用）"""
+    try:
+        HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+        return True
+    except OSError:
+        return False
+
+
+def _auto_title(messages: list) -> str:
+    """用第一条 user 消息前 30 字作为标题"""
+    for msg in messages:
+        if msg.get("role") == "user":
+            content = msg.get("content", "").strip()
+            if content:
+                return content[:30] + ("…" if len(content) > 30 else "")
+    return "新对话"
+
+
+def _save_session(session_id: str, messages: list, title: str = None) -> bool:
+    """保存会话到 JSON 文件。返回是否成功。"""
+    if not messages:
+        return False
+    if not _ensure_history_dir():
+        return False
+    if not title:
+        title = _auto_title(messages)
+
+    filepath = HISTORY_DIR / f"{session_id}.json"
+    is_new = not filepath.exists()
+
+    # 读取已有文件，保留 created_at
+    existing_created = None
+    if not is_new:
+        try:
+            existing = json.loads(filepath.read_text(encoding="utf-8"))
+            existing_created = existing.get("created_at")
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    now_iso = datetime.datetime.now().isoformat(timespec="seconds")
+    session = {
+        "id": session_id,
+        "title": title,
+        "created_at": existing_created or now_iso,
+        "updated_at": now_iso,
+        "messages": messages,
+    }
+
+    try:
+        filepath.write_text(
+            json.dumps(session, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return True
+    except OSError:
+        return False
+
+
+def _load_all_sessions() -> list:
+    """加载所有历史会话（按 updated_at 倒序）"""
+    if not HISTORY_DIR.exists():
+        return []
+    sessions = []
+    for filepath in HISTORY_DIR.glob("*.json"):
+        try:
+            data = json.loads(filepath.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and "id" in data:
+                sessions.append(data)
+        except (json.JSONDecodeError, OSError):
+            continue
+    return sorted(
+        sessions,
+        key=lambda s: s.get("updated_at", ""),
+        reverse=True,
+    )
+
+
+def _load_session_messages(session_id: str) -> list:
+    """加载指定会话的 messages 列表"""
+    filepath = HISTORY_DIR / f"{session_id}.json"
+    if not filepath.exists():
+        return []
+    try:
+        data = json.loads(filepath.read_text(encoding="utf-8"))
+        return data.get("messages", []) if isinstance(data, dict) else []
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def _delete_session(session_id: str) -> bool:
+    """删除指定会话文件"""
+    filepath = HISTORY_DIR / f"{session_id}.json"
+    try:
+        if filepath.exists():
+            filepath.unlink()
+            return True
+    except OSError:
+        pass
+    return False
 
 
 # ============== 工具 schema（OpenAI 兼容） ==============
@@ -587,9 +697,70 @@ with st.sidebar:
         help="这里只填 AI 的角色/语气/性格。工具调用的强制规则在代码里硬编码，会自动附加。",
     )
     st.divider()
-    if st.button("🗑️ 清空对话"):
-        st.session_state.messages = []
-        st.rerun()
+
+    # ============== 历史会话区 ==============
+    st.header("📚 历史会话")
+
+    history_available = _ensure_history_dir()
+    if not history_available:
+        st.warning(
+            f"⚠️ 历史目录不可用：`{HISTORY_DIR}`\n\n"
+            "（Streamlit Cloud 上历史功能不可用，本地运行有效）"
+        )
+    else:
+        # 顶部操作按钮
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🆕 新对话", use_container_width=True):
+                st.session_state.messages = []
+                st.session_state.current_session_id = str(uuid.uuid4())
+                st.session_state.session_title = "新对话"
+                st.rerun()
+        with col2:
+            if st.button("🗑 清空", use_container_width=True):
+                st.session_state.messages = []
+                st.rerun()
+
+        st.caption(f"📂 `{HISTORY_DIR}`")
+        st.divider()
+
+        # 列出历史会话（最多 30 条）
+        sessions = _load_all_sessions()
+        if not sessions:
+            st.caption("暂无历史对话。开始聊天后会自动保存。")
+        else:
+            for sess in sessions[:30]:
+                sid = sess.get("id", "")
+                title = sess.get("title", "未命名") or "未命名"
+                updated = sess.get("updated_at", "")[:16].replace("T", " ")
+                is_current = sid == st.session_state.get("current_session_id")
+
+                # 标题 + 当前标记
+                prefix = "👉 " if is_current else "📄 "
+                col_a, col_b = st.columns([5, 1])
+                with col_a:
+                    if st.button(
+                        f"{prefix}{title}",
+                        key=f"load_{sid}",
+                        use_container_width=True,
+                        disabled=is_current,
+                    ):
+                        msgs = _load_session_messages(sid)
+                        st.session_state.messages = msgs
+                        st.session_state.current_session_id = sid
+                        st.session_state.session_title = title
+                        st.rerun()
+                with col_b:
+                    if st.button("🗑", key=f"del_{sid}"):
+                        _delete_session(sid)
+                        if is_current:
+                            st.session_state.messages = []
+                            st.session_state.current_session_id = str(uuid.uuid4())
+                            st.session_state.session_title = "新对话"
+                        st.rerun()
+                st.caption(f"   {updated} · {len(sess.get('messages', []))} 条消息")
+
+    st.divider()
 
 # ============== 密钥校验 ==============
 if not DEEPSEEK_API_KEY or DEEPSEEK_API_KEY == "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx":
@@ -607,8 +778,13 @@ if not DEEPSEEK_API_KEY or DEEPSEEK_API_KEY == "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 st.divider()
 st.header("💬 和 AI 聊聊天")
 
+# Session state 初始化
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "current_session_id" not in st.session_state:
+    st.session_state.current_session_id = str(uuid.uuid4())
+if "session_title" not in st.session_state:
+    st.session_state.session_title = "新对话"
 
 # 显示历史
 for msg in st.session_state.messages:
@@ -715,3 +891,14 @@ if user_input and user_input.strip():
             final_text, _ = run_agent(user_input, model, temperature, full_system_prompt)
 
     st.session_state.messages.append({"role": "assistant", "content": final_text})
+
+    # 自动保存到历史（标题用首条 user 消息）
+    if _ensure_history_dir():
+        # 如果标题还是默认的"新对话"，更新成首条 user 消息
+        if st.session_state.session_title == "新对话":
+            st.session_state.session_title = _auto_title(st.session_state.messages)
+        _save_session(
+            st.session_state.current_session_id,
+            st.session_state.messages,
+            st.session_state.session_title,
+        )
