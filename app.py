@@ -771,9 +771,9 @@ if not DEEPSEEK_API_KEY or DEEPSEEK_API_KEY == "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 st.divider()
 st.markdown(
     "<div style='text-align: center; line-height: 1.8; font-size: 18px;'>"
-    "您好。我叫凯伦<br>"
-    "我是痞老板的智能管家<br>"
-    "请问有什么可以帮您?"
+    "您好。我是凯伦<br>"
+    "一个专属您的智能 ai 伴侣<br>"
+    "您可以从左侧菜单中定义专属您伴侣的名字，性格，以及地域。"
     "</div>",
     unsafe_allow_html=True,
 )
