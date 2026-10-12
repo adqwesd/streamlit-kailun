@@ -769,7 +769,7 @@ if not DEEPSEEK_API_KEY or DEEPSEEK_API_KEY == "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 # ============== 对话区 ==============
 st.divider()
-st.header("💬 和 AI 聊聊天")
+st.header("💬 您好,我是凯伦,痞老板的智能管家,请问我有什么可以帮您?")
 
 # Session state 初始化
 if "messages" not in st.session_state:
