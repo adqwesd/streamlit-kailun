@@ -679,10 +679,13 @@ st.set_page_config(
 )
 
 # ============== 登录校验（未登录就显示登录窗口并停止渲染） ==============
+# 开关：要开启登录窗口就把 False 改成 True（APP_PASSWORD 也要在 Secrets 配）
+LOGIN_ENABLED = False
+
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
 
-if not st.session_state.authenticated:
+if LOGIN_ENABLED and not st.session_state.authenticated:
     # 登录窗口（居中卡片）
     _, mid, _ = st.columns([1, 1.2, 1])
     with mid:
@@ -806,11 +809,12 @@ with st.sidebar:
 
     st.divider()
 
-    # 退出登录
-    if st.button("🚪 退出登录", use_container_width=True):
-        st.session_state.authenticated = False
-        st.session_state.messages = []
-        st.rerun()
+    # 退出登录（仅在登录开启时显示）
+    if LOGIN_ENABLED:
+        if st.button("🚪 退出登录", use_container_width=True):
+            st.session_state.authenticated = False
+            st.session_state.messages = []
+            st.rerun()
 
 # ============== 密钥校验 ==============
 if not DEEPSEEK_API_KEY or DEEPSEEK_API_KEY == "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx":
