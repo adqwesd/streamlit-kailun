@@ -721,7 +721,6 @@ with st.sidebar:
                 st.session_state.messages = []
                 st.rerun()
 
-        st.caption(f"📂 `{HISTORY_DIR}`")
         st.divider()
 
         # 列出历史会话（最多 30 条）
