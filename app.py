@@ -769,7 +769,14 @@ if not DEEPSEEK_API_KEY or DEEPSEEK_API_KEY == "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 # ============== 对话区 ==============
 st.divider()
-st.markdown("## 💬 您好.我叫凯伦\n\n我是痞老板的智能管家\n\n请问有什么可以帮您?")
+st.markdown(
+    "<div style='text-align: center; line-height: 1.8; font-size: 18px;'>"
+    "您好。我叫凯伦<br>"
+    "我是痞老板的智能管家<br>"
+    "请问有什么可以帮您?"
+    "</div>",
+    unsafe_allow_html=True,
+)
 
 # Session state 初始化
 if "messages" not in st.session_state:
