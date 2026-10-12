@@ -54,27 +54,6 @@ if hasattr(_sys.stdout, "reconfigure"):
 
 del _locale, _os, _sys
 
-"""
-真实工具（非模拟）：
-- get_current_time：获取当前时间
-- calculate：数学计算
-- get_weather：调用高德地图 API 查询天气
-
-为什么不用 openai SDK？
-  openai SDK 内部某处调用 .encode() 不带 encoding 参数，在 Streamlit Cloud
-  容器（sys.getdefaultencoding()='ascii'）下遇到中文会爆 'ascii' codec error。
-
-为什么不用 requests / urllib.request / http.client？
-  - requests 底层用 urllib3，urllib3 编码 HTTP header 时调 .encode('latin-1')
-  - urllib.request 底层走 http.client.HTTPConnection
-  - http.client.HTTPConnection.putheader() 硬编码用 latin-1 编码所有 header value
-  任何一个路径都会爆 'latin-1' codec error。
-  改用纯 socket + ssl 自己拼 HTTP 报文，彻底绕开所有标准库编码路径。
-
-部署到 Streamlit Cloud 后，请在 Settings → Secrets 配置：
-  DEEPSEEK_API_KEY = "sk-..."
-  AMAP_API_KEY     = "你的高德 key"
-"""
 
 # ============== 正常 import ==============
 import os
@@ -100,7 +79,8 @@ from dotenv import load_dotenv
 import streamlit as st
 
 # 加载本地 .env（仅本机使用，不会被 Git 上传）
-load_dotenv()
+# override=True 强制 .env 覆盖系统环境变量（避免被 Machine 级旧 key 抢读）
+load_dotenv(override=True)
 
 
 # ============== 密钥读取 ==============
@@ -114,6 +94,29 @@ def get_secret(key: str) -> str:
 
 DEEPSEEK_API_KEY = get_secret("DEEPSEEK_API_KEY")
 AMAP_API_KEY = get_secret("AMAP_API_KEY")
+
+
+def _diag_key(value: str, name: str) -> str:
+    """返回 key 的诊断信息（脱敏）"""
+    if not value:
+        return f"❌ {name} 未配置"
+    lines = [
+        f"**{name} 长度**：{len(value)}",
+        f"**前 4 字符**：`{value[:4]}`",
+        f"**后 4 字符**：`{value[-4:]}`",
+        f"**首字符 ord**：{ord(value[0])}",
+        f"**尾字符 ord**：{ord(value[-1])}",
+    ]
+    if name == "DEEPSEEK_API_KEY":
+        lines.append(f"**以 'sk-' 开头**：{'✅' if value.startswith('sk-') else '❌'}")
+    # 检查非可打印字符
+    bad = [(i, c, ord(c)) for i, c in enumerate(value) if ord(c) < 32 or ord(c) > 126]
+    if bad:
+        lines.append(f"⚠️ 发现非可打印字符：{bad[:5]}")
+    else:
+        lines.append("✅ 所有字符都是可打印 ASCII")
+    return "\n\n".join(lines)
+
 
 # DeepSeek 兼容 OpenAI 接口
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
@@ -541,42 +544,46 @@ def _iter_body(sock, initial_buffer, is_chunked):
 
 
 def _read_chunked(sock, initial_buffer):
-    """解码 chunked transfer encoding 的流"""
+    """解码 chunked transfer encoding 的流。
+
+    简化方案：因为请求带了 'Connection: close'，服务器关闭 socket 时即响应结束。
+    所以一次性把整个 body 读到内存里，再用 regex 拆 chunks。
+    这样能彻底避开"socket 延迟把 trailing \\r\\n 单独发来"的边界情况。
+    """
+    # 1. 一次性读完所有 body（Connection: close 模式）
     buffer = initial_buffer
     while True:
-        # 找 chunk size 行
-        while b"\r\n" not in buffer:
-            chunk = sock.recv(4096)
-            if not chunk:
-                return
-            buffer += chunk
+        chunk = sock.recv(8192)
+        if not chunk:
+            break
+        buffer += chunk
+        # 兜底：限制最大 body 大小（防止内存爆）
+        if len(buffer) > 50 * 1024 * 1024:
+            raise RuntimeError("Response body 超过 50MB")
 
-        line_end = buffer.find(b"\r\n")
-        size_line = buffer[:line_end].decode("ascii", errors="replace").strip()
-        chunk_size_str = size_line.split(";", 1)[0].strip()
+    # 2. 用 regex 拆 chunked 块
+    import re
+    # 匹配 "<hex_size>\r\n<data>\r\n"
+    # 注意：size 行可能包含 chunk-extension（用 ; 分割），忽略
+    pattern = re.compile(rb'([0-9a-fA-F]+)(?:;[^\r\n]*)?\r\n', re.ASCII)
+    pos = 0
+    while pos < len(buffer):
+        m = pattern.search(buffer, pos)
+        if not m:
+            return
         try:
-            chunk_size = int(chunk_size_str, 16)
+            chunk_size = int(m.group(1), 16)
         except ValueError:
             return
-
         if chunk_size == 0:
             return  # 终止 chunk
-
-        # 读 chunk 数据（可能跨多次 recv）
-        buffer = buffer[line_end + 2:]
-        while len(buffer) < chunk_size:
-            chunk = sock.recv(max(4096, chunk_size - len(buffer)))
-            if not chunk:
-                return
-            buffer += chunk
-
-        yield buffer[:chunk_size]
-        buffer = buffer[chunk_size:]
-        # 跳过 trailing \r\n
-        if buffer.startswith(b"\r\n"):
-            buffer = buffer[2:]
-        elif buffer.startswith(b"\n"):
-            buffer = buffer[1:]
+        data_start = m.end()
+        data_end = data_start + chunk_size
+        if data_end > len(buffer):
+            # 截断的 chunk，忽略
+            return
+        yield buffer[data_start:data_end]
+        pos = data_end + 2  # 跳过 trailing \r\n（如果存在）
 
 
 def _post_json(payload: dict):
@@ -653,6 +660,11 @@ def call_deepseek_stream(messages, model, temperature):
             choices = chunk_json.get("choices") or []
             if choices:
                 delta = choices[0].get("delta") or {}
+                # reasoner 模型的思考过程（先于 content 输出）
+                reasoning = delta.get("reasoning_content") or ""
+                if reasoning:
+                    yield reasoning
+                # 最终回复内容
                 content = delta.get("content") or ""
                 if content:
                     yield content
@@ -665,28 +677,14 @@ st.set_page_config(
     layout="centered",
 )
 
-st.title("🎉 WelcomeScreen · Agent")
-st.subheader("DeepSeek Agent：天气 🌤️ 计算 🧮 时间 🕐，自动调用真实工具")
-
-st.markdown(
-    """
-    👋 这是一个**真正的 AI Agent**，不是模拟！
-
-    当你问下面这些类型的问题，AI 会**自动调用工具**：
-    - 🕐 **"现在几点？"** → 调用 `get_current_time`
-    - 🧮 **"123 × 456 等于多少？"** → 调用 `calculate`
-    - 🌤️ **"北京今天天气怎么样？"** → 调用 `get_weather`（高德 API）
-    """
-)
-
 # ============== 侧边栏 ==============
 with st.sidebar:
     st.header("⚙️ 设置")
     model = st.selectbox(
         "选择模型",
-        ["deepseek-reasoner", "deepseek-chat"],
+        ["deepseek-chat", "deepseek-reasoner"],
         index=0,
-        help="deepseek-reasoner：深度思考模型，对工具调用更稳定；deepseek-chat：通用对话模型",
+        help="deepseek-chat：通用对话模型，回复快；deepseek-reasoner：深度思考模型，思考过程较长",
     )
     temperature = st.slider("Temperature", min_value=0.0, max_value=1.5, value=0.5, step=0.1)
     # 侧边栏：只让用户填角色部分（语气/性格/人物设定）
@@ -862,17 +860,13 @@ def run_agent(user_input: str, model: str, temperature: float, system_prompt: st
             continue  # 继续下一轮
 
         # 没有 tool_calls，进入最终流式输出
+        # ⚠️ 不在这里 st.empty() 渲染，避免和外层 st.markdown 重复
         final_text = ""
-        placeholder = st.empty()
         try:
             for delta in call_deepseek_stream(messages, model, temperature):
                 final_text += delta
-                placeholder.markdown(final_text + "▌")
-            placeholder.markdown(final_text)
         except Exception as e:
             final_text = f"流式输出失败：{e}"
-            placeholder.markdown(final_text)
-
         return final_text, []
 
 
@@ -884,10 +878,16 @@ if user_input and user_input.strip():
         st.markdown(user_input)
 
     with st.chat_message("assistant"):
-        with st.spinner("思考中..."):
-            # 用户角色 + 代码硬编码的强制规则
-            full_system_prompt = role_prompt + SYSTEM_PROMPT_RULES
-            final_text, _ = run_agent(user_input, model, temperature, full_system_prompt)
+        try:
+            with st.spinner("思考中..."):
+                # 用户角色 + 代码硬编码的强制规则
+                full_system_prompt = role_prompt + SYSTEM_PROMPT_RULES
+                final_text, _ = run_agent(user_input, model, temperature, full_system_prompt)
+        except BaseException as e:
+            # 捕获所有异常（包括非 Exception 子类），避免静默失败
+            final_text = f"❌ 出错了：{type(e).__name__}: {e}"
+        # ⚠️ 必须在 chat_message 上下文里显式渲染，否则不显示
+        st.markdown(final_text if final_text else "（空回复）")
 
     st.session_state.messages.append({"role": "assistant", "content": final_text})
 
