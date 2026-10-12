@@ -94,6 +94,7 @@ def get_secret(key: str) -> str:
 
 DEEPSEEK_API_KEY = get_secret("DEEPSEEK_API_KEY")
 AMAP_API_KEY = get_secret("AMAP_API_KEY")
+APP_PASSWORD = get_secret("APP_PASSWORD")
 
 
 def _diag_key(value: str, name: str) -> str:
@@ -677,6 +678,56 @@ st.set_page_config(
     layout="centered",
 )
 
+# ============== 登录校验（未登录就显示登录窗口并停止渲染） ==============
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+
+if not st.session_state.authenticated:
+    # 登录窗口（居中卡片）
+    _, mid, _ = st.columns([1, 1.2, 1])
+    with mid:
+        st.markdown(
+            "<div style='text-align: center; padding: 12px 0 4px 0;'>"
+            "<span style='font-size: 42px;'>🔐</span></div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            "<h3 style='text-align: center; margin-top: 0;'>访问凯伦智能管家</h3>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            "<p style='text-align: center; color: gray; margin-top: -8px;'>请输入访问密码</p>",
+            unsafe_allow_html=True,
+        )
+        pwd = st.text_input(
+            "密码",
+            type="password",
+            placeholder="请输入密码...",
+            key="login_pwd",
+            label_visibility="collapsed",
+        )
+        col_btn_l, col_btn_r = st.columns([1, 1])
+        with col_btn_r:
+            login_clicked = st.button("🔓 登录", use_container_width=True, type="primary")
+        if login_clicked:
+            if not APP_PASSWORD:
+                st.error("⚠️ 未配置 APP_PASSWORD。请在 Streamlit Secrets 或 .env 添加。")
+            elif pwd == APP_PASSWORD:
+                st.session_state.authenticated = True
+                st.rerun()
+            else:
+                st.error("❌ 密码错误，请重试")
+
+        # 提示
+        st.markdown(
+            "<p style='text-align: center; color: #999; font-size: 12px; margin-top: 24px;'>"
+            "没有密码？请联系管理员获取"
+            "</p>",
+            unsafe_allow_html=True,
+        )
+    st.stop()  # 没登录就不渲染下面的内容
+
+
 # ============== 侧边栏 ==============
 with st.sidebar:
     st.header("⚙️ 设置")
@@ -754,6 +805,12 @@ with st.sidebar:
                 st.caption(f"   {updated} · {len(sess.get('messages', []))} 条消息")
 
     st.divider()
+
+    # 退出登录
+    if st.button("🚪 退出登录", use_container_width=True):
+        st.session_state.authenticated = False
+        st.session_state.messages = []
+        st.rerun()
 
 # ============== 密钥校验 ==============
 if not DEEPSEEK_API_KEY or DEEPSEEK_API_KEY == "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx":
