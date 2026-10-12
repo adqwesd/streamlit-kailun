@@ -794,80 +794,116 @@ for msg in st.session_state.messages:
             st.markdown(msg["content"])
 
 
-# ============== Agent 循环 ==============
-def run_agent(user_input: str, model: str, temperature: float, system_prompt: str):
-    """
-    Agent 循环：调用模型 → 如果有 tool_calls 就执行工具 → 把工具结果加入 messages →
-    再调一次模型 → 直到模型不再调用工具，最后流式输出回复。
-    """
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_input},
-    ]
+# ============== 上下文长度限制 ==============
+# DeepSeek-chat 上下文窗口 32K-64K tokens。
+# 中文 1 字 ≈ 1.5-2 tokens，英文 1 字 ≈ 0.25-0.5 tokens。
+# 简单按字符数估算：超过 24000 字符时截断最早的历史。
+MAX_CONTEXT_CHARS = 24000
 
-    while True:
-        # 第一轮（决策阶段）：非流式
+
+def _build_messages_with_history(history: list, user_input: str, system_prompt: str) -> list:
+    """
+    构造发给 DeepSeek 的 messages 列表：
+    [system, ...历史 user/assistant（可能截断）, user_input]
+
+    当历史超过 MAX_CONTEXT_CHARS 时，丢弃最早的非 system 消息对。
+    """
+    messages = [{"role": "system", "content": system_prompt}]
+
+    # 拼接所有历史消息的文本（用于估算长度）
+    total_chars = len(system_prompt)
+    kept_history = []
+    for msg in history:
+        # 只保留 user/assistant 消息（tool 消息留给 _run_agent_loop 内部处理）
+        if msg.get("role") not in ("user", "assistant"):
+            continue
+        content = msg.get("content") or ""
+        kept_history.append({"role": msg["role"], "content": content})
+        total_chars += len(content)
+
+    # 如果超限，从最早开始丢弃
+    while total_chars > MAX_CONTEXT_CHARS and len(kept_history) > 2:
+        removed = kept_history.pop(0)
+        total_chars -= len(removed.get("content", ""))
+
+    messages.extend(kept_history)
+    messages.append({"role": "user", "content": user_input})
+    return messages
+
+
+# ============== Agent 循环 ==============
+def _run_agent_loop(initial_messages: list, model: str, temperature: float):
+    """
+    同步处理多轮 Agent 循环（决策 + 工具调用）。
+
+    参数:
+      initial_messages: 已经包含 system + 历史 + 当前 user 的 messages 列表
+      model, temperature: 模型参数
+
+    返回 (messages, error)：
+      - messages: 处理完所有工具调用后的 messages 列表（最后一条是 user/assistant/tool）
+      - error: None 表示成功，可继续流式输出；非 None 表示出错（已经是错误字符串）
+
+    调用方在拿到 messages 后再调 call_deepseek_stream 流式输出最终回复。
+    """
+    messages = list(initial_messages)  # 复制，避免改外部
+
+    for _ in range(10):  # 最多 10 轮，防止无限循环
+        # 决策阶段：非流式调用模型
         try:
             resp_json = call_deepseek_non_stream(messages, model, temperature)
         except Exception as e:
-            return f"调用失败：{e}", []
+            return messages, f"调用失败：{e}"
 
         choice = (resp_json.get("choices") or [{}])[0]
         msg = choice.get("message") or {}
 
-        # 模型想调用工具
+        # 没有 tool_calls：循环结束，调用方开始流式输出
         tool_calls = msg.get("tool_calls")
-        if tool_calls:
-            # 把模型这一轮（带 tool_calls）加入 messages
-            messages.append({
-                "role": "assistant",
-                "content": msg.get("content") or "",
-                "tool_calls": [
-                    {
-                        "id": tc.get("id"),
-                        "type": "function",
-                        "function": {
-                            "name": tc["function"]["name"],
-                            "arguments": tc["function"]["arguments"],
-                        },
-                    }
-                    for tc in tool_calls
-                ],
-            })
-            # 执行每个工具
-            for tc in tool_calls:
-                fn_name = tc["function"]["name"]
-                fn_args_raw = tc["function"].get("arguments") or "{}"
-                try:
-                    fn_args = json.loads(fn_args_raw)
-                except json.JSONDecodeError:
-                    fn_args = {}
-                fn = TOOL_FUNCS.get(fn_name)
-                if not fn:
-                    result = f"错误：未知工具 {fn_name}"
-                else:
-                    try:
-                        result = fn(**fn_args)
-                    except Exception as e:
-                        result = f"工具执行出错：{e}"
-                # 工具结果加入 messages
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.get("id"),
-                    "name": fn_name,
-                    "content": str(result),
-                })
-            continue  # 继续下一轮
+        if not tool_calls:
+            return messages, None
 
-        # 没有 tool_calls，进入最终流式输出
-        # ⚠️ 不在这里 st.empty() 渲染，避免和外层 st.markdown 重复
-        final_text = ""
-        try:
-            for delta in call_deepseek_stream(messages, model, temperature):
-                final_text += delta
-        except Exception as e:
-            final_text = f"流式输出失败：{e}"
-        return final_text, []
+        # 把模型这一轮（带 tool_calls）加入 messages
+        messages.append({
+            "role": "assistant",
+            "content": msg.get("content") or "",
+            "tool_calls": [
+                {
+                    "id": tc.get("id"),
+                    "type": "function",
+                    "function": {
+                        "name": tc["function"]["name"],
+                        "arguments": tc["function"]["arguments"],
+                    },
+                }
+                for tc in tool_calls
+            ],
+        })
+
+        # 执行每个工具
+        for tc in tool_calls:
+            fn_name = tc["function"]["name"]
+            fn_args_raw = tc["function"].get("arguments") or "{}"
+            try:
+                fn_args = json.loads(fn_args_raw)
+            except json.JSONDecodeError:
+                fn_args = {}
+            fn = TOOL_FUNCS.get(fn_name)
+            if not fn:
+                result = f"错误：未知工具 {fn_name}"
+            else:
+                try:
+                    result = fn(**fn_args)
+                except Exception as e:
+                    result = f"工具执行出错：{e}"
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.get("id"),
+                "name": fn_name,
+                "content": str(result),
+            })
+
+    return messages, "工具调用超过 10 轮，强制结束"
 
 
 # ============== 用户输入 ==============
@@ -878,16 +914,35 @@ if user_input and user_input.strip():
         st.markdown(user_input)
 
     with st.chat_message("assistant"):
+        final_text = ""
         try:
+            full_system_prompt = role_prompt + SYSTEM_PROMPT_RULES
+            # 1. 构造带历史的 messages（自动截断超长上下文）
+            history = st.session_state.messages[:-1]  # 排除刚 append 的 user
+            initial_messages = _build_messages_with_history(
+                history, user_input, full_system_prompt
+            )
+            # 2. 同步处理多轮工具调用（用户看不到过程，spinner 包裹）
             with st.spinner("思考中..."):
-                # 用户角色 + 代码硬编码的强制规则
-                full_system_prompt = role_prompt + SYSTEM_PROMPT_RULES
-                final_text, _ = run_agent(user_input, model, temperature, full_system_prompt)
+                messages, err = _run_agent_loop(
+                    initial_messages, model, temperature
+                )
+            if err:
+                # 出错：直接显示错误信息（不流式）
+                st.markdown(err)
+                final_text = err
+            else:
+                # 3. 流式输出最终回复（st.write_stream 实现真正的逐字显示）
+                final_text = st.write_stream(
+                    call_deepseek_stream(messages, model, temperature)
+                )
+                if not final_text:
+                    st.markdown("（空回复）")
+                    final_text = "（空回复）"
         except BaseException as e:
             # 捕获所有异常（包括非 Exception 子类），避免静默失败
             final_text = f"❌ 出错了：{type(e).__name__}: {e}"
-        # ⚠️ 必须在 chat_message 上下文里显式渲染，否则不显示
-        st.markdown(final_text if final_text else "（空回复）")
+            st.markdown(final_text)
 
     st.session_state.messages.append({"role": "assistant", "content": final_text})
 
